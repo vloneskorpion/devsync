@@ -8,7 +8,7 @@ type DiffType int
 
 const (
 	DiffMissingRemote DiffType = iota
-	DiffMissingLocal
+	// DiffMissingLocal
 	DiffDifferent
 )
 
@@ -48,17 +48,17 @@ func CheckForSnapshotDifferences(local, remote *shared.SharedData) []DiffEntry {
 		}
 	}
 
-	// Check files existing remotely but missing locally
-	for path, remoteInfo := range remote.Snapshot {
-		if _, ok := local.Snapshot[path]; !ok {
-			diffs = append(diffs, DiffEntry{
-				Path:   path,
-				Type:   DiffMissingLocal,
-				Local:  shared.FileInfo{},
-				Remote: remoteInfo,
-			})
-		}
-	}
+	// Check files existing remotely but missing locally - future feature
+	// for path, remoteInfo := range remote.Snapshot {
+	// 	if _, ok := local.Snapshot[path]; !ok {
+	// 		diffs = append(diffs, DiffEntry{
+	// 			Path:   path,
+	// 			Type:   DiffMissingLocal,
+	// 			Local:  shared.FileInfo{},
+	// 			Remote: remoteInfo,
+	// 		})
+	// 	}
+	// }
 
 	return diffs
 }

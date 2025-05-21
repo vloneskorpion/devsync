@@ -7,14 +7,18 @@ import (
 	"sync"
 	"time"
 
+	"log/slog"
+
 	"github.com/fsnotify/fsnotify"
 )
 
 type Config struct {
-	User     string
-	Ip       string
-	Password string
-	Port     string
+	User       string
+	Ip         string
+	Password   string
+	Port       string
+	PrivateKey string
+	KnownHosts string
 }
 
 type Syncer struct {
@@ -53,15 +57,15 @@ func (s *Syncer) Init() error {
 		return err
 	}
 
-	s.uploader = NewUploader(s.config)
-	err = s.uploader.Init()
+	s.uploader, err = NewUploader(s.config)
 	if err != nil {
 		return err
 	}
 
-	s.remoteSnapshot.Mu.Lock()
-	s.remoteSnapshot.Snapshot, err = s.uploader.GetRemoteSnapshot(s.remoteBasePath)
-	s.remoteSnapshot.Mu.Unlock()
+	err = s.uploader.Init()
+	if err != nil {
+		return err
+	}
 
 	if err != nil {
 		return err
@@ -86,9 +90,8 @@ func (s *Syncer) eventCollector() {
 		select {
 		case evt := <-s.event:
 			dedup[evt.Name] = true
-			fmt.Printf("Event added: %v, size of map: %d\n", evt, len(dedup))
+			//Trigger sync if too many events are queued
 			if len(dedup) > 1000 {
-				fmt.Println("⚠️ Too many files queued. Forcing sync.")
 				s.triggerSync()
 				dedup = make(map[string]bool)
 				lastSync = time.Now()
@@ -98,7 +101,6 @@ func (s *Syncer) eventCollector() {
 
 			// Throttle: ensure max delay is not exceeded
 			if time.Since(lastSync) > maxDelay {
-				fmt.Println("Triggered 3s sync")
 				s.triggerSync()
 				dedup = make(map[string]bool)
 				lastSync = time.Now()
@@ -107,7 +109,6 @@ func (s *Syncer) eventCollector() {
 
 		case <-timer.C:
 			if len(dedup) > 0 {
-				fmt.Println("Triggered 500ms sync")
 				s.triggerSync()
 				dedup = make(map[string]bool)
 				lastSync = time.Now()
@@ -135,34 +136,22 @@ func (s *Syncer) Run() error {
 
 	go s.eventCollector()
 
-	// wait for
 	<-s.initSync
 	s.triggerSync()
 
 	for range s.syncTrigger {
-		start := time.Now()
-
 		s.remoteSnapshot.Mu.Lock()
 		s.remoteSnapshot.Snapshot, err = s.uploader.GetRemoteSnapshot(s.GetRemotePath())
 		s.remoteSnapshot.Mu.Unlock()
 		if err != nil {
-			fmt.Println("Failed to get remote snapshot:", err)
+			slog.Warn("Failed to get remote snapshot", "warning", err)
 		}
 
 		diffs := CheckForSnapshotDifferences(&s.localSnapshot, &s.remoteSnapshot)
-		// for _, diff := range diffs {
-		// 	switch diff.Type {
-		// 	case DiffMissingRemote:
-		// 		s.uploader.Sync(s.GetBasePath(), s.GetBasePath()+diff.Path, s.GetRemotePath())
-		// 		fmt.Println("Missing on remote: ", diff.Path)
+
 		// 	// case DiffMissingLocal: // for now skip -d option for remote
 		// 	// 	s.uploader.Delete(s.GetRemotePath() + diff.Path)
 		// 	// 	fmt.Println("Missing on local: ", diff.Path)
-		// 	case DiffDifferent:
-		// 		s.uploader.Sync(s.GetBasePath(), s.GetBasePath()+diff.Path, s.GetRemotePath())
-		// 		fmt.Println("Different: ", diff.Path)
-		// 	}
-		// }
 
 		type UploadJob struct {
 			localBasePath string
@@ -170,9 +159,9 @@ func (s *Syncer) Run() error {
 			remoteFolder  string
 		}
 
-		jobs := make(chan UploadJob, 100)
+		jobs := make(chan UploadJob, 50)
 		wg := sync.WaitGroup{}
-		workerCount := 50 // You can tune this based on CPU/network
+		workerCount := 50 // Tune this based on CPU/network
 
 		for i := 0; i < workerCount; i++ {
 			wg.Add(1)
@@ -188,14 +177,13 @@ func (s *Syncer) Run() error {
 			if diff.Type == DiffMissingRemote || diff.Type == DiffDifferent {
 				jobs <- UploadJob{
 					localBasePath: s.GetBasePath(),
-					localFilePath: s.GetBasePath() + diff.Path,
+					localFilePath: diff.Path,
 					remoteFolder:  s.GetRemotePath(),
 				}
 			}
 		}
 		close(jobs)
 		wg.Wait()
-		fmt.Println("Sync time: ", time.Since(start))
 	}
 
 	select {}
@@ -207,7 +195,7 @@ func (s *Syncer) Close() {
 	s.uploader.Close()
 }
 
-func (s *Syncer) PrintlocalSnapshot() {
+func (s *Syncer) PrintLocalSnapshot() {
 	s.localSnapshot.Mu.Lock()
 	defer s.localSnapshot.Mu.Unlock()
 

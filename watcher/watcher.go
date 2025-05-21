@@ -2,9 +2,8 @@ package watcher
 
 import (
 	"devsync/shared"
-	"fmt"
 	"io/fs"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -68,11 +67,11 @@ func (w *Watcher) Init() error {
 }
 
 func (w *Watcher) Watch(localPath string, eventChan chan fsnotify.Event) {
-	// Create new watcher.
 	var err error
 	w.watcher, err = fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to create watcher", "error", err)
+		return
 	}
 	defer w.watcher.Close()
 
@@ -85,10 +84,8 @@ func (w *Watcher) Watch(localPath string, eventChan chan fsnotify.Event) {
 				}
 
 				if isOneOfMany(event, fsnotify.Rename, fsnotify.Remove) {
-					log.Println("Action happened: ", event)
 					_, err := os.Stat(event.Name)
 					if os.IsNotExist(err) {
-						log.Println("Removing: ", event.Name)
 						w.watcher.Remove(event.Name)
 						relPath, _ := filepath.Rel(localPath, event.Name)
 						w.localSnapshot.Mu.Lock()
@@ -98,11 +95,9 @@ func (w *Watcher) Watch(localPath string, eventChan chan fsnotify.Event) {
 				}
 
 				if isOneOfMany(event, fsnotify.Write, fsnotify.Create, fsnotify.Chmod) {
-					log.Println("Action happened: ", event)
-
 					fileInfo, err := os.Stat(event.Name)
 					if err != nil {
-						log.Println(err)
+						slog.Error("Failed to stat file", "error", err)
 						continue
 					}
 					if !fileInfo.IsDir() {
@@ -115,7 +110,6 @@ func (w *Watcher) Watch(localPath string, eventChan chan fsnotify.Event) {
 						w.localSnapshot.Mu.Unlock()
 					} else {
 						if event.Has(fsnotify.Create) {
-							fmt.Println("Adding directory and its subdirs: ", event.Name)
 							w.watcher.Add(event.Name)
 							filepath.WalkDir(event.Name, watchDirFunc(w.watcher, w.localSnapshot, localPath))
 						}
@@ -127,14 +121,14 @@ func (w *Watcher) Watch(localPath string, eventChan chan fsnotify.Event) {
 				if !ok {
 					return
 				}
-				log.Println("error:", err)
+				slog.Error("Watcher error:", "error", err)
 			}
 		}
 	}()
 
 	err = filepath.WalkDir(localPath, watchDirFunc(w.watcher, w.localSnapshot, localPath))
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to walk directory", "error", err, "localPath", localPath)
 	}
 
 	w.initSync <- struct{}{}

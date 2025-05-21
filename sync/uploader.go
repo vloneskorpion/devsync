@@ -6,37 +6,97 @@ import (
 	"devsync/shared"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type Uploader struct {
-	sshClient   *ssh.Client
-	config      *ssh.ClientConfig
-	sftpClient  *sftp.Client
-	addr        string
-	createdDirs sync.Map
+	sshClient  *ssh.Client
+	config     *ssh.ClientConfig
+	sftpClient *sftp.Client
+	addr       string
 }
 
-func NewUploader(config Config) *Uploader {
+func getPrivateKey() (string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		slog.Error("Failed to get current user home directory", "error", err)
+		return "", err
+	}
+	return userHome + "/.ssh/id_rsa", nil
+}
+
+func getKnownHosts() (string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		slog.Error("Failed to get current user home directory", "error", err)
+		return "", err
+	}
+	return userHome + "/.ssh/known_hosts", nil
+}
+
+func parsePrivateKey(keyPath string) (ssh.Signer, error) {
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		slog.Error("Failed to read private key", "error", err)
+		return nil, err
+	}
+	return ssh.ParsePrivateKey(key)
+}
+
+func getFileName(path string) string {
+	return filepath.Base(path)
+}
+
+func NewUploader(config Config) (*Uploader, error) {
+	var err error
+	keyPath := config.PrivateKey
+	if keyPath == "" {
+		keyPath, err = getPrivateKey()
+		if err != nil {
+			return nil, err
+		}
+	}
+	key, err := parsePrivateKey(keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	knownHosts := config.KnownHosts
+	if knownHosts == "" {
+		knownHosts, err = getKnownHosts()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	hostKeyCallback, err := knownhosts.New(knownHosts)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Uploader{
 		sshClient: nil,
 		config: &ssh.ClientConfig{
 			User: config.User,
 			Auth: []ssh.AuthMethod{
-				ssh.Password(config.Password), // or use ssh.PublicKeys(...)
+				// ssh.Password(config.Password), // or use ssh.PublicKeys(...)
+				// ssh.Password(currentUser), // or use ssh.PublicKeys(...)
+				ssh.PublicKeys(key),
 			},
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(), // for testing only
+			HostKeyCallback: hostKeyCallback,
 		},
 		sftpClient: nil,
 		addr:       config.Ip + ":" + config.Port,
-	}
+	}, nil
 }
 
 func (u *Uploader) Init() error {
@@ -102,30 +162,35 @@ func (u *Uploader) GetRemoteSnapshot(remoteBasePath string) (map[string]shared.F
 }
 
 func (u *Uploader) Sync(localBasePath, localFilePath, remoteFolder string) error {
+	absoluteLocalPath := localBasePath + localFilePath
+
 	// Open local file (for regular file copy — skip for symlinks)
-	srcFile, err := os.Open(localFilePath)
+	srcFile, err := os.Open(absoluteLocalPath)
 	if err != nil {
-		return fmt.Errorf("failed to open local file %s: %w", localFilePath, err)
+		slog.Error("Failed to open local file", "error", err)
+		return fmt.Errorf("failed to open local file %s: %w", absoluteLocalPath, err)
 	}
 	defer srcFile.Close()
 
 	// Use Lstat to avoid following symlinks
-	localFileInfo, err := os.Lstat(localFilePath)
+	localFileInfo, err := os.Lstat(absoluteLocalPath)
 	if err != nil {
-		return fmt.Errorf("failed to lstat local file %s: %w", localFilePath, err)
+		slog.Error("Failed to lstat local file", "error", err)
+		return fmt.Errorf("failed to lstat local file %s: %w", absoluteLocalPath, err)
 	}
 
-	// Build remote path
-	remoteFilePath := remoteFolder + getRelativePath(localBasePath, localFilePath)
+	remoteFilePath := remoteFolder + localFilePath
 
 	// Handle symlinks
 	if localFileInfo.Mode()&os.ModeSymlink != 0 {
-		linkTarget, err := os.Readlink(localFilePath)
+		linkTarget, err := os.Readlink(absoluteLocalPath)
 		if err != nil {
-			return fmt.Errorf("failed to read symlink %s: %w", localFilePath, err)
+			slog.Error("Failed to read symlink", "error", err, "absoluteLocalPath", absoluteLocalPath)
+			return fmt.Errorf("failed to read symlink %s: %w", absoluteLocalPath, err)
 		}
 
 		if err := u.sftpClient.Symlink(linkTarget, remoteFilePath); err != nil {
+			slog.Error("Failed to create remote symlink", "error", err, "remoteFilePath", remoteFilePath, "linkTarget", linkTarget)
 			return fmt.Errorf("failed to create remote symlink %s -> %s: %w", remoteFilePath, linkTarget, err)
 		}
 
@@ -133,7 +198,6 @@ func (u *Uploader) Sync(localBasePath, localFilePath, remoteFolder string) error
 		return nil
 	}
 
-	// Determine the parent directory (even for files)
 	var remoteDir string
 	if localFileInfo.IsDir() {
 		remoteDir = remoteFilePath
@@ -141,32 +205,33 @@ func (u *Uploader) Sync(localBasePath, localFilePath, remoteFolder string) error
 		remoteDir = path.Dir(remoteFilePath)
 	}
 
-	// Ensure remote directory exists (cache creation)
-	if _, ok := u.createdDirs.Load(remoteDir); !ok {
-		if err := u.sftpClient.MkdirAll(remoteDir); err != nil {
-			return fmt.Errorf("failed to create remote directory %s: %w", remoteDir, err)
-		}
-		u.createdDirs.Store(remoteDir, struct{}{})
+	// Ensure remote directory exists
+	if err := u.sftpClient.MkdirAll(remoteDir); err != nil {
+		slog.Error("Failed to create remote directory", "error", err, "remoteDir", remoteDir)
+		return fmt.Errorf("failed to create remote directory %s: %w", remoteDir, err)
 	}
 
 	// Create remote file
 	dstFile, err := u.sftpClient.Create(remoteFilePath)
 	if err != nil {
+		slog.Error("failed to create remote file", "error", err, "remoteFilePath", remoteFilePath)
 		return fmt.Errorf("failed to create remote file %s: %w", remoteFilePath, err)
 	}
 	defer dstFile.Close()
 
 	// Copy contents
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		slog.Error("Failed to copy data to remote file", "error", err, "remoteFilePath", remoteFilePath)
 		return fmt.Errorf("failed to copy data to %s: %w", remoteFilePath, err)
 	}
 
 	// Set timestamps
 	if err := u.sftpClient.Chtimes(remoteFilePath, localFileInfo.ModTime(), localFileInfo.ModTime()); err != nil {
+		slog.Error("Failed to set timestamps on remote file", "error", err, "remoteFilePath", remoteFilePath)
 		return fmt.Errorf("failed to set timestamps on %s: %w", remoteFilePath, err)
 	}
 
-	fmt.Printf("Uploaded: %s\n", getFileName(localFilePath))
+	slog.Info("Uploaded", "file", localFilePath)
 	return nil
 }
 
@@ -177,9 +242,9 @@ func (u *Uploader) Delete(remoteFilePath string) error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		fmt.Printf("Failed to delete remote file %s: %v\n", remoteFilePath, err)
-		return err
+		slog.Error("Failed to delete remote file", "error", err, "remoteFilePath", remoteFilePath)
+		return fmt.Errorf("failed to delete remote file %s: %w", remoteFilePath, err)
 	}
-	fmt.Printf("Deleted remote file: %s\n", remoteFilePath)
+	slog.Info("Deleted remote file", "file", getFileName(remoteFilePath))
 	return nil
 }
